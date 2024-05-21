@@ -8,10 +8,13 @@ import datetime
 import os
 import re
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
 import numpy as np
 import torch
 import torchmetrics
 import transformers
+from transformers import get_linear_schedule_with_warmup
 
 from reading_comprehension_dataset import ReadingComprehensionDataset
 from trainable_module import TrainableModule
@@ -20,30 +23,170 @@ from pprint import pprint as pp
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", default=2, type=int, help="Batch size.")
-parser.add_argument("--epochs", default=1, type=int, help="Number of epochs.")
+parser.add_argument("--batch_size", default=32, type=int, help="Batch size.")
+parser.add_argument("--epochs", default=14, type=int, help="Number of epochs.")
+parser.add_argument("--uepochs", default=2, type=int, help="Number of epochs.")
 parser.add_argument("--seed", default=42, type=int, help="Random seed.")
 parser.add_argument("--threads", default=16, type=int, help="Maximum number of threads to use.")
 
+
+class Example:
+    def __init__(self, question, context, start_char_idx, answer_text, all_answers, tokenizer, test):
+        self.question = question
+        self.context = context
+        self.start_char_idx = start_char_idx
+        self.answer_text = answer_text
+        self.all_answers = all_answers
+        self.skip = False
+        self.tokenizer = tokenizer
+        self.test = test
+        self.token = None
+
+    def preprocess(self):
+        context = " ".join(self.context.split())
+        question = " ".join(self.question.split())
+        answer = " ".join(self.answer_text.split())
+
+        end_char_idx = self.start_char_idx + len(answer)
+        if end_char_idx >= len(context):
+            self.skip = True
+            return
+
+        is_char_in_ans = [0] * len(context)
+        for idx in range(self.start_char_idx, end_char_idx):
+            is_char_in_ans[idx] = 1
+
+        tokenized_context = self.tokenizer(context, return_offsets_mapping=True)
+
+        self.token = tokenized_context
+
+        ans_token_idx = []
+        for idx, (start, end) in enumerate(tokenized_context['offset_mapping']):
+            if sum(is_char_in_ans[start:end]) > 0:
+                ans_token_idx.append(idx)
+        
+        if len(ans_token_idx) and not self.test == 0:
+            self.skip = True
+            return
+
+        if len(ans_token_idx)== 0 and self.test:
+            start_token_idx = -1
+            end_token_idx = -1
+
+        else:
+            start_token_idx = ans_token_idx[0]
+            end_token_idx = ans_token_idx[-1]
+
+        tokenized_question = self.tokenizer(question)
+
+
+        input_ids = tokenized_context['input_ids'] + tokenized_question['input_ids'][1:]
+        token_type_ids = [0] * len(tokenized_context['input_ids']) + [1] * len(tokenized_question['input_ids'][1:])
+        attention_mask = [1] * len(input_ids)
+
+        # Truncate if necessary
+        if len(input_ids) > 512:
+            input_ids = input_ids[:512]
+            attention_mask = attention_mask[:512]
+            token_type_ids = token_type_ids[:512]
+
+            if start_token_idx >= 512 or end_token_idx >= 512 and self.test:
+                start_token_idx = -1
+                end_token_idx = -1
+            else:
+                self.skip = True
+                return
+
+        # Pad if necessary
+        padding_length = 512 - len(input_ids)
+        if padding_length > 0:
+            input_ids += [self.tokenizer.pad_token_id] * padding_length
+            attention_mask += [0] * padding_length
+            token_type_ids += [0] * padding_length
+
+        self.input_ids = input_ids
+        self.token_type_ids = token_type_ids
+        self.attention_mask = attention_mask
+        self.start_token_idx = start_token_idx
+        self.end_token_idx = end_token_idx
+        self.token = tokenized_context
+
+
+
+def create_squad_examples(raw_data, tokenizer, test=False):
+    squad_examples = []
+    #print(raw_data)
+    for item in raw_data:
+        context = item["context"]
+        for qa in item["qas"]:
+            question = qa["question"]
+            
+            
+            if test:
+                start_char_idx = 0
+                answer_text = ""
+                all_answers = [""]
+            else:
+                start_char_idx = qa["answers"][0]["start"]
+                answer_text = qa["answers"][0]["text"]
+                all_answers = [_["text"] for _ in qa["answers"]] 
+            
+            squad_eg = Example(question, context, start_char_idx, answer_text, all_answers, tokenizer, test)
+            squad_eg.preprocess()
+            squad_examples.append(squad_eg)
+    
+    return squad_examples
+
+def create_inputs_targets(examples):
+    dataset_dict = {
+        "input_ids": [],
+        "attention_mask": [],
+        "start_token_idx": [],
+        "end_token_idx": [],
+    }
+    for item in examples:
+        if not item.skip:
+            dataset_dict["input_ids"].append(item.input_ids)
+            dataset_dict["attention_mask"].append(item.attention_mask)
+            dataset_dict["start_token_idx"].append(item.start_token_idx)
+            dataset_dict["end_token_idx"].append(item.end_token_idx)
+
+    for key in dataset_dict:
+        #print(torch.tensor(dataset_dict[key]).shape)
+        dataset_dict[key] = torch.tensor(dataset_dict[key])
+    
+    inputs = {
+        "input_ids": dataset_dict["input_ids"],
+        "attention_mask": dataset_dict["attention_mask"]
+        #"tokenizer": dataset_dict["tokenizer"]
+    }
+    targets = torch.tensor(list(zip(dataset_dict["start_token_idx"], dataset_dict["end_token_idx"])))
+
+    return inputs, targets
 
 class Model(TrainableModule):
     def __init__(self, args, robeczech):
         super().__init__()
 
         self.backbone = robeczech
-        self.output = torch.nn.Linear(robeczech.config.hidden_size, 2)
+        self.output_start = torch.nn.Linear(robeczech.config.hidden_size, 1)
+        self.output_end = torch.nn.Linear(robeczech.config.hidden_size,1)
 
         # freeze the backbone
         for param in self.backbone.parameters():
             param.requires_grad = False
+    
+    def forward(self, input_ids, attention_mask) -> torch.Tensor:
 
-    def forward(self, x) -> torch.Tensor:
-        #x = x[0]
+        outputs = self.backbone(input_ids=input_ids,
+                                attention_mask=attention_mask)
 
-        x = self.backbone(x['input_ids'], attention_mask=x['attention_mask']).last_hidden_state
-        x = self.output(x)
+        x = outputs.last_hidden_state
+        x_start = self.output_start(x).squeeze(-1)
+        x_end = self.output_end(x).squeeze(-1)
 
-        return x
+        return x_start, x_end
+    
 
 def main(args: argparse.Namespace) -> None:
     # Set the random seed and the number of threads.
@@ -64,162 +207,97 @@ def main(args: argparse.Namespace) -> None:
     tokenizer = transformers.AutoTokenizer.from_pretrained("ufal/robeczech-base")
     robeczech = transformers.AutoModel.from_pretrained("ufal/robeczech-base")
 
-    # Load the data
+    special_tokens_dict = {"additional_special_tokens": [".", ","]}
+    num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+    robeczech.resize_token_embeddings(len(tokenizer))
+
     dataset = ReadingComprehensionDataset()
+    
 
-    def create_dataset(dataset, is_test=False):
-        """Create dataset from ReadingComprehensionDataset in tuple form."""
-        data = []
+    print("creating train examples")
+    train_squad_examples = create_squad_examples(dataset.train.paragraphs, tokenizer)
+    print("finished train examples")
+    #x_train, y_train = create_inputs_targets(train_squad_examples)
 
-        for elem in tqdm(dataset):
-            for x in elem['qas']:
-                context, question = elem['context'], x['question']
+    print("creating dev examples")
+    dev_squad_examples = create_squad_examples(dataset.dev.paragraphs, tokenizer)
+    print("finished dev examples")
+    #x_dev, y_dev = create_inputs_targets(dev_squad_examples)
 
-                tokens = tokenizer(
-                    context, question,
-                    return_tensors='pt',
-                    padding=True,
-                    max_length=512,
-                    truncation='only_first'
-                )
+    print("creating test examples")
+    test_squad_examples = create_squad_examples(dataset.test.paragraphs, tokenizer, test=True)
+    print("finisehd test examples\n\n\n")
+    #x_test, y_test = create_inputs_targets(test_squad_examples)
 
-                if is_test:
-                    data.append((
-                        {'context' : context, 'question': question},
-                        {'start': 0, 'end': 0}
-                    ))
-                    continue
-
-                start = x['answers'][0]['start']
-                end = start + len(x['answers'][0]['text'])
-
-                if tokens.char_to_token(start) is None or tokens.char_to_token(end) is None:
-                    continue
-
-                data.append((
-                    {'context' : context, 'question': question},
-                    {'start': start, 'end': end}
-                ))
-
-        return data
-
-    def prepare_batch(data):
-        """Prepare batch for the model used in collate_fn."""
-        inputs, targets = zip(*data)
-
-        cx = [x['context'] for x in inputs]
-        q = [x['question'] for x in inputs]
-
-        tokens = tokenizer(
-            cx, q,
-            return_tensors='pt',
-            padding=True,
-            max_length=512,
-            truncation='only_first',
-        )
-
-        targets = torch.tensor([
-            (tokens.char_to_token(i, x['start']), tokens.char_to_token(i, x['end']))
-            for i, x in enumerate(targets)
-        ])
-
-        #return tokens, (tokens, targets)
-        return tokens, targets
-
-    def create_dataloader(data, shuffle=False):
-        """Create DataLoader from dataset."""
-
-        return torch.utils.data.DataLoader(
-            data,
-            args.batch_size,
-            shuffle=shuffle,
-            collate_fn=prepare_batch,
-            # num_workers=8, persistent_workers=True
-        )
-
-    # Create dataloaders
-    print('Creating dataloaders...')
-    train = create_dataset(dataset.train.paragraphs)
-    dev = create_dataset(dataset.dev.paragraphs)
-    test = create_dataset(dataset.test.paragraphs, is_test=True)
-
-    train_dataloader = create_dataloader(train, shuffle=True)
-    dev_dataloader = create_dataloader(dev, shuffle=False)
-    test_dataloader = create_dataloader(test, shuffle=False)
+    train_dataloader = torch.utils.data.DataLoader(train_squad_examples, batch_size=args.batch_size, shuffle=True, collate_fn=create_inputs_targets)
+    dev_dataloader = torch.utils.data.DataLoader(dev_squad_examples, batch_size=args.batch_size, shuffle=False, collate_fn=create_inputs_targets)
+    test_dataloader = torch.utils.data.DataLoader(test_squad_examples, batch_size=1, shuffle=False, collate_fn=create_inputs_targets)
 
     model = Model(args, robeczech)
+    
+    optimizer_grouped_parameters = [
+        {"params": [p for n, p in model.named_parameters() if "backbone" in n], "lr": 1e-5},
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n], "lr": 5e-5},
+    ]
 
-    model.configure(
-        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
-        loss=torch.nn.CrossEntropyLoss(
-            ignore_index=tokenizer.convert_tokens_to_ids('[PAD]')
-        ),
-        # metrics={"accuracy": torchmetrics.Accuracy(
-        #     "multiclass",
-        #     num_classes=len(tokenizer.get_vocab()) - 1,
-        #     ignore_index=tokenizer.convert_tokens_to_ids('[PAD]')
-        # )},
-    )
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
+    total_steps = len(train_dataloader) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.convert_tokens_to_ids('[PAD]'))
 
-    print('Training...')
+    model.configure(optimizer=optimizer, loss=loss_fn)
+
+    print("configured model")
+
+    # Training
     model.fit(train_dataloader, dev=dev_dataloader, epochs=args.epochs)
-    """
-    predictions = model.predict(test_dataloader)
 
-    for i, x in enumerate(predictions):
+    for param in model.backbone.parameters():
+        param.requires_grad = True
 
-        context = test[i]['context']
+    # Reconfigure optimizer and scheduler
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=0.01)
+    total_steps = len(train_dataloader) * args.uepochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+    
+    model.configure(optimizer=optimizer, loss=loss_fn)
 
-        x = np.array(x)
-        x = np.argmax(x, axis=0)
+    train_dataloader = torch.utils.data.DataLoader(train_squad_examples, batch_size=4, shuffle=True, collate_fn=create_inputs_targets)
+    dev_dataloader = torch.utils.data.DataLoader(dev_squad_examples, batch_size=4, shuffle=False, collate_fn=create_inputs_targets)
 
-        # tokens.token_(start)
-        print(x)
+    # Continue training with unfrozen backbone
+    model.fit(train_dataloader, dev=dev_dataloader, epochs=args.uepochs)
 
-        break
-    """
-    #exit()
-    # Generate test set annotations, but in `args.logdir` to allow parallel execution.
+    # Evaluation
+    print('Predicting...')
+    predictions = model.predict(test_dataloader, as_numpy=True)
+
     os.makedirs(args.logdir, exist_ok=True)
     with open(os.path.join(args.logdir, "reading_comprehension.txt"), "w", encoding="utf-8") as predictions_file:
-        # TODO: Predict the answers as strings, one per line.
-        predictions = model.predict(test_dataloader)
+        for i, (_, _) in enumerate(test_dataloader):
+            #context = test[i][0]['context']
+            context = train_squad_examples[i].context
+            start_logits_batch, end_logits_batch = predictions[i]
+            pred_start = np.argmax(start_logits_batch)
+            pred_end = np.argmax(end_logits_batch)
 
-        for i, (tokens, inputs) in enumerate(test_dataloader):
-            print(i)
-            context = test[i][0]['context']
-
-            # Get predictions for start and end positions
-            #pred_start, pred_end = predictions[i].split(1, dim=-1)
-            pred_start, pred_end = predictions[i][:, 0], predictions[i][:, 1]
+            tokens = train_squad_examples[i].token
             
-            #print(pred_start.shape)
-            #print(pred_end.shape)
-            #exit()
-
-            #pred_start = pred_start.squeeze(-1).argmax(dim=-1).item()
-            #pred_end = pred_end.squeeze(-1).argmax(dim=-1).item()
-
-            pred_start = np.argmax(pred_start)
-            pred_end = np.argmax(pred_end)
-
-            # Convert token positions back to character positions
-            
-            start_char_info = tokens.token_to_chars(0, pred_start)
-            end_char_info = tokens.token_to_chars(0, pred_end)
-
-            if start_char_info is not None and end_char_info is not None:
-                start_char = start_char_info.start
-                end_char = end_char_info.end
-                answer_text = context[start_char:end_char]
-                print(answer_text, file=predictions_file)
+            if tokens is not None:
+                start_char_info = tokens.token_to_chars(0, pred_start)
+                end_char_info = tokens.token_to_chars(0, pred_end)
+                if start_char_info is not None and end_char_info is not None:
+                    start_char = start_char_info.start
+                    end_char = end_char_info.end
+                    answer_text = context[start_char:end_char]
+                    print(answer_text)
+                    print(answer_text, file=predictions_file)
+                else:
+                    print("", file=predictions_file)
             else:
                 print("", file=predictions_file)
-        #predictions = model.predict(test_dataloader)
-
-        #for answer in predictions:
-        #    print(answer, file=predictions_file)
-
+    total_predictions = sum(1 for line in open(os.path.join(args.logdir, "reading_comprehension.txt")))
+    print(f"Total predictions made: {total_predictions}")
 
 if __name__ == "__main__":
     args = parser.parse_args([] if "__file__" not in globals() else None)

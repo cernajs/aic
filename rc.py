@@ -22,7 +22,7 @@ from tqdm import tqdm
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch_size", default=4, type=int, help="Batch size.")
 parser.add_argument("--epochs", default=4, type=int, help="Number of epochs.")
-parser.add_argument("--uepochs", default=4, type=int, help="Number of unfreezed epochs.")
+parser.add_argument("--uepochs", default=3, type=int, help="Number of unfreezed epochs.")
 parser.add_argument("--seed", default=42, type=int, help="Random seed.")
 parser.add_argument("--threads", default=16, type=int, help="Maximum number of threads to use.")
 
@@ -33,9 +33,9 @@ class Model(TrainableModule):
 
         self.backbone = robeczech
         self.hidden = torch.nn.Linear(robeczech.config.hidden_size, 1024)
-        self.dropout = torch.nn.Dropout(0.4)
-        self.output_start = torch.nn.Linear(1024, 1)
-        self.output_end = torch.nn.Linear(1024,1)
+        self.dropout = torch.nn.Dropout(0.5)
+        self.output_start = torch.nn.Linear(robeczech.config.hidden_size, 1)
+        self.output_end = torch.nn.Linear(robeczech.config.hidden_size,1)
         self.relu = torch.nn.ReLU()
 
         self.simple = torch.nn.Linear(robeczech.config.hidden_size, 2)
@@ -49,12 +49,6 @@ class Model(TrainableModule):
         x = self.backbone(x['input_ids'], attention_mask=x['attention_mask']).last_hidden_state
         #x = self.relu(self.hidden(x))
         #x = self.dropout(x)
-        #x = self.output(x)
-        
-        #x = self.simple(x)
-            
-        x = self.relu(self.hidden(x))
-        x = self.dropout(x)
         x_start = self.output_start(x).squeeze(-1)
         x_end = self.output_end(x).squeeze(-1)
 
@@ -81,12 +75,11 @@ def main(args: argparse.Namespace) -> None:
     tokenizer = transformers.AutoTokenizer.from_pretrained("ufal/robeczech-base")
     robeczech = transformers.AutoModel.from_pretrained("ufal/robeczech-base")
 
-
+    """
     special_tokens_dict = {"additional_special_tokens": [".", ","]}
     num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
-
     robeczech.resize_token_embeddings(len(tokenizer))
-    
+    """ 
 
     dataset = ReadingComprehensionDataset()
 
@@ -199,7 +192,7 @@ def main(args: argparse.Namespace) -> None:
     model = Model(args, robeczech)
 
     model.configure(
-        optimizer=torch.optim.Adam(model.parameters(), lr=1e-5),
+        optimizer=torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01),
         loss=torch.nn.CrossEntropyLoss(
             ignore_index=tokenizer.convert_tokens_to_ids('[PAD]')
         ),
@@ -215,8 +208,13 @@ def main(args: argparse.Namespace) -> None:
     for param in model.backbone.parameters():
         param.requires_grad = True
 
+    optimizer_grouped_parameters = [
+        {"params": [p for n, p in model.named_parameters() if "backbone" in n], "lr": 1e-5},
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n], "lr": 5e-5},
+    ]
+
     model.configure(
-        optimizer=torch.optim.Adam(model.parameters(), lr=1e-5),
+        optimizer=torch.optim.AdamW(optimizer_grouped_parameters, lr=1e-5, weight_decay=0.01),
         loss=torch.nn.CrossEntropyLoss(
             ignore_index=tokenizer.convert_tokens_to_ids('[PAD]')
         ),
@@ -227,6 +225,8 @@ def main(args: argparse.Namespace) -> None:
         # )},
     )
 
+    train_dataloader = create_dataloader(train, shuffle=True, batch_size=8)
+    dev_dataloader = create_dataloader(dev, shuffle=False, batch_size=8)
     model.fit(train_dataloader, dev=dev_dataloader, epochs=args.uepochs)
     
     j = 0
