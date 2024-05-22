@@ -18,8 +18,8 @@ from trainable_module import TrainableModule
 # Also, you can set the number of threads to 0 to use all your CPU cores.
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch_size", default=32, type=int, help="Batch size.")
-parser.add_argument("--epochs", default=25, type=int, help="Number of epochs.")
-parser.add_argument("--uepochs", default=3, type=int, help="Number of epochs.")
+parser.add_argument("--epochs", default=3, type=int, help="Number of epochs.")
+parser.add_argument("--uepochs", default=2, type=int, help="Number of epochs.")
 parser.add_argument("--seed", default=42, type=int, help="Random seed.")
 parser.add_argument("--threads", default=1, type=int, help="Maximum number of threads to use.")
 
@@ -62,6 +62,7 @@ def main(args: argparse.Namespace) -> None:
 
     def create_dataset(dataset, is_test=False):
         data = []
+        i = 0
         for elem in dataset:
             for x in elem['qas']:
 
@@ -86,12 +87,13 @@ def main(args: argparse.Namespace) -> None:
                     continue
 
                 start = x['answers'][0]['start']
-                end = start + len(x['answers'][0]['text'])
+                end = start + len(x['answers'][0]['text']) - 1
 
                 token_start = tokens.char_to_token(start)
                 token_end = tokens.char_to_token(end)
 
                 if token_start is None or token_end is None:
+                    #i += 1
                     continue
 
                 data.append((
@@ -100,6 +102,8 @@ def main(args: argparse.Namespace) -> None:
                     #targets
                 ))
 
+        #print(f"skipped {i} examples")
+        #exit()
         return data
 
 
@@ -180,8 +184,6 @@ def main(args: argparse.Namespace) -> None:
         for i in range(len(test)):
             context = test[i][0]['context']
             tokens = test[i][0]['tokens']
-            #print(predictions[i])
-            #start_logits_batch, end_logits_batch = predictions[i]
             
             start_logits_batch, end_logits_batch = predictions[i][:, 0], predictions[i][:, 1]
 
@@ -195,15 +197,10 @@ def main(args: argparse.Namespace) -> None:
                 start_char = start_char_info.start
                 end_char = end_char_info.end
                 answer_text = context[start_char:end_char]
-                print(answer_text)
                 print(answer_text, file=predictions_file)
             else:
                 print("", file=predictions_file)
 
-        # TODO: Predict the answers as strings, one per line.
-        #predictions = ...
-        #for answer in predictions:
-        #    print(answer, file=predictions_file)
 
 
 if __name__ == "__main__":
