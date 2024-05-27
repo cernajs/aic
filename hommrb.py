@@ -406,11 +406,11 @@ class Model(TrainableModule):
         inputs = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(inp, dtype=torch.long) for inp in inputs],
             batch_first=True, padding_value=0#HOMRDataset.MARKS[0]
-        )
+        ).to(encoded.device)
 
         self._target_rnn_cell.setup_memory(encoded)
 
-        x = self._target_embedding(inputs.cpu())
+        x = self._target_embedding(inputs)
         
         state = encoded[:,0,:]
         
