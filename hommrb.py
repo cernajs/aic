@@ -20,7 +20,7 @@ from homr_dataset import HOMRDataset
 
 parser = argparse.ArgumentParser()
 # These arguments will be set appropriately by ReCodEx, even if you change them.
-parser.add_argument("--batch_size", default=2, type=int, help="Batch size.")
+parser.add_argument("--batch_size", default=16, type=int, help="Batch size.")
 parser.add_argument("--cle_dim", default=64, type=int, help="CLE embedding dimension.")
 parser.add_argument("--epochs", default=10, type=int, help="Number of epochs.")
 parser.add_argument("--max_sentences", default=None, type=int, help="Maximum number of sentences to load.")
@@ -294,6 +294,7 @@ class Model(TrainableModule):
     def __init__(self, homr: HOMRDataset, args: argparse.Namespace) -> None:
         super().__init__()
         self._target_vocab = homr.MARKS
+        self.args = args
 
         # TODO(lemmatizer_noattn): Define
         # - `self._source_embedding` as an embedding layer of source characters into `args.cle_dim` dimensions
@@ -352,7 +353,8 @@ class Model(TrainableModule):
                 )
 
             self._target_embedding = embedding_function
-        print(f"len(self._target_vocab) {len(self._target_vocab)}")
+        
+        #print(f"len(self._target_vocab) {len(self._target_vocab)}")
         # Initialize the layers using the Keras-inspired initialization. You can try
         # removing this line to see how much worse the default PyTorch initialization is.
         self.apply(self.keras_init)
@@ -361,32 +363,21 @@ class Model(TrainableModule):
         self._batches = 0
 
 
-    def forward(self, images, marks, input_lengths, mark_lengths):
-        encode = self.encoder(images, input_lengths)
+    def forward(self, images, input_lengths = None, marks = None, mark_lengths = None):
+        if input_lengths is None:
+            il = torch.tensor([200, 200])
+            encode = self.encoder(images, il)
+        else:
+            encode = self.encoder(images, input_lengths)
         if mark_lengths is not None:
             #return self.decoder_training(images, marks, input_lengths, mark_lengths)
             return self.decoder_training(encode, marks)
         else:
-            return self.decoder_prediction(encode, input_lengths, max_length=encode.shape[1] + 10)
+            return self.decoder_prediction(encode, max_length=encode.shape[1] + 10)
 
 
     def encoder(self, images: torch.Tensor, input_lengths) -> torch.Tensor:
 
-        """
-        embedded = self._source_embedding(forms)
-
-        packed = torch.nn.utils.rnn.pack_padded_sequence(
-            embedded,
-            torch.sum(forms != MorphoDataset.PAD, dim=1).cpu(),
-            batch_first=True, enforce_sorted=False
-        )
-
-        hidden, _ = self._source_rnn(packed)
-        hidden, _ = torch.nn.utils.rnn.pad_packed_sequence(hidden, batch_first=True)
-        hidden = hidden[:, :, :hidden.size(2) // 2] + hidden[:, :, hidden.size(2) // 2:]
-
-        return hidden
-        """
         images = images.permute(0, 3, 1, 2)
 
         x = self.conv(images)
@@ -396,7 +387,7 @@ class Model(TrainableModule):
 
         x = self.dense(x)
         new_input_lengths = (input_lengths // 4).cpu()
-
+        
         x = torch.nn.utils.rnn.pack_padded_sequence(x, new_input_lengths, batch_first=True, enforce_sorted=False)
         x, _ = self.rnn(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
@@ -419,24 +410,14 @@ class Model(TrainableModule):
 
         self._target_rnn_cell.setup_memory(encoded)
 
-        #print("decoder_training setup memory")
-        #print(f"inputs {inputs.shape}")
-        #print(f"targets {targets.shape}")        
-        
-        x = self._target_embedding(inputs)
-        
-        #print(f"x {x.shape}")
+        x = self._target_embedding(inputs.cpu())
         
         state = encoded[:,0,:]
         
-        #print(f"state {state.shape}")
-        #print(f"args.rnn_dim {args.rnn_dim}") 64
-
         outputs = []
         for i in range(inputs.size(1)):
             x_t = x[:, i, :]
             state = self._target_rnn_cell(x_t, state)
-            #print(f"state shape {state.shape}")
             outputs.append(state)
         
         #print(f"len(outputs) {len(outputs)}")
@@ -505,21 +486,25 @@ class Model(TrainableModule):
         return self.metrics.compute()
 
     def train_step(self, xs, y):
-        #print("train step")
         result = super().train_step(xs, y)
-
-        #print(xs[0][:1])
-        #print(xs[0][:1].shape)
-        #print(f"result {result.shape}")
         
         self._batches += 1
-        
+       
+        #print(self.predict_step((xs[0][:2],)))
+        #exit()
+
         if self._batches % self._show_results_every_batch == 0:
+            
+            predicted_indices = self.predict_step((xs[0][:self.args.batch_size],))[0]
+            predicted_indices = predicted_indices.tolist()
+            predicted_words = [self._target_vocab[idx] for idx in predicted_indices]
+
             self._tqdm.write("{}: {} -> {}".format(
                 self._batches,
                 "idk",#"".join(self._source_vocab.strings(np.trim_zeros(xs[0][0].numpy(force=True)))),
-                "".join(self._target_vocab(self.predict_step((xs[0][:1],))[0]))))
-        
+                #"".join(self._target_vocab[self.predict_step((xs[0][:2],))[0]])))
+                "".join(predicted_words)))
+
         return result
 
     def test_step(self, xs, y):
@@ -529,7 +514,6 @@ class Model(TrainableModule):
 
     def predict_step(self, xs, as_numpy=True):
         with torch.no_grad():
-            print(xs)
             batch = self.forward(*xs)
             #batch = self.decoder_prediction(*xs)
             # If `as_numpy==True`, trim t.shhe predictions at the first EOW.
@@ -611,21 +595,20 @@ def main(args: argparse.Namespace) -> None:
             images = torch.stack([torch.tensor(img) for img in data])
             images_lengths = torch.tensor([len(image) for image in images])
             images = torch.nn.utils.rnn.pad_sequence(images, batch_first=True)
-            return (images, torch.tensor(0), images_lengths, torch.tensor(0)), torch.tensor(0)
+            #return (images, images_lengths, torch.tensor(0), torch.tensor(0)), torch.tensor(0)
+            return (images, images_lengths), torch.tensor(0)
 
         images, marks = zip(*data)
 
         images_lengths = torch.tensor([len(image) for image in images])
         images = torch.stack([torch.tensor(img) for img in images])
 
-        #marks = [x + [homr_eow] for x in marks]
-
         marks_lengths = torch.tensor([len(mark) for mark in marks])
         marks = torch.nn.utils.rnn.pad_sequence(marks, batch_first=True)
         marks = torch.stack([x for x in marks])
 
 
-        return (images, marks, images_lengths, marks_lengths), marks
+        return (images, images_lengths, marks,  marks_lengths), marks
 
     train = torch.utils.data.DataLoader(train, args.batch_size, shuffle=True, collate_fn=lambda x: prepare_batch(x, is_test=False))
     dev = torch.utils.data.DataLoader(dev, args.batch_size, shuffle=False, collate_fn=lambda x: prepare_batch(x, is_test=False))
@@ -654,10 +637,11 @@ def main(args: argparse.Namespace) -> None:
         predictions = model.predict(test)
 
         for sequence in predictions:
-            best_hypothesis = sequence[0]
-            #print(" ".join(homr.MARKS[mark] for mark in sequence), file=predictions_file)
-            sentence = "".join(homr.MARKS[char] for char in best_hypothesis.tokens.tolist())
-            print(sentence, file=predictions_file)
+            print(sequence)
+            #best_hypothesis = sequence[0]
+            print(" ".join(homr.MARKS[mark] for mark in sequence), file=predictions_file)
+            #sentence = "".join(homr.MARKS[char] for char in best_hypothesis.tokens.tolist())
+            #print(sentence, file=predictions_file)
 
 
 if __name__ == "__main__":
