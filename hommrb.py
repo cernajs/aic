@@ -20,12 +20,12 @@ from homr_dataset import HOMRDataset
 
 parser = argparse.ArgumentParser()
 # These arguments will be set appropriately by ReCodEx, even if you change them.
-parser.add_argument("--batch_size", default=16, type=int, help="Batch size.")
+parser.add_argument("--batch_size", default=32, type=int, help="Batch size.")
 parser.add_argument("--cle_dim", default=64, type=int, help="CLE embedding dimension.")
-parser.add_argument("--epochs", default=10, type=int, help="Number of epochs.")
+parser.add_argument("--epochs", default=30, type=int, help="Number of epochs.")
 parser.add_argument("--max_sentences", default=None, type=int, help="Maximum number of sentences to load.")
 parser.add_argument("--recodex", default=False, action="store_true", help="Evaluation in ReCodEx.")
-parser.add_argument("--rnn_dim", default=64, type=int, help="RNN layer dimension.")
+parser.add_argument("--rnn_dim", default=512, type=int, help="RNN layer dimension.")
 parser.add_argument("--seed", default=42, type=int, help="Random seed.")
 parser.add_argument("--show_results_every_batch", default=10, type=int, help="Show results every given batch.")
 parser.add_argument("--tie_embeddings", default=False, action="store_true", help="Tie target embeddings.")
@@ -306,31 +306,57 @@ class Model(TrainableModule):
         # - `self._target_rnn_cell` as a `WithAttention` with `attention_dim=args.rnn_dim`, employing as the
         #   underlying cell the `torch.nn.GRUCell` with `args.rnn_dim`. The cell will process concatenated
         #   target character embeddings and the result of the attention mechanism.
-        self._target_rnn_cell = WithAttention(torch.nn.GRUCell(args.rnn_dim * 2, args.rnn_dim), args.rnn_dim)
+        self._target_rnn_cell = WithAttention(torch.nn.GRUCell(args.rnn_dim + 64, args.rnn_dim), args.rnn_dim)
 
         self.conv = torch.nn.Sequential(
             torch.nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(32),
             torch.nn.ReLU(),
             torch.nn.MaxPool2d(2),
+            
             torch.nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(64),
+            torch.nn.ReLU(),
+            torch.nn.MaxPool2d(2),
+
+            torch.nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(128),
+            torch.nn.ReLU(),
+            torch.nn.MaxPool2d(2),
+
+            torch.nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(256),
             torch.nn.ReLU(),
             torch.nn.MaxPool2d(2),
         )
-
+        """
         image_height = 200
+        image_width = 1720
         self.dense = torch.nn.Sequential(
-            torch.nn.Linear((image_height // 4) * 64, 64),
+            #torch.nn.Linear((image_width // 16) * (image_height // 16) * 256, 512),
+            torch.nn.Linear(256,512),
             torch.nn.ReLU(),
             torch.nn.Dropout(0.2)
         )
-
+        """
         self.rnn = torch.nn.LSTM(
-                        input_size=64,
+                        input_size=256,
                         hidden_size=args.rnn_dim,
-                        num_layers=3,
+                        num_layers=1,
                         bidirectional=True,
-                        batch_first=True
+                        batch_first=True,
+                        dropout=0.2
                     )
+        
+        self.secrnn = torch.nn.LSTM(
+                        input_size=args.rnn_dim,
+                        hidden_size=args.rnn_dim,
+                        num_layers=1,
+                        bidirectional=True,
+                        batch_first=True,
+                        dropout=0.2
+                    )
+        
 
         # TODO(lemmatizer_noattn): Then define
         # - `self._target_output_layer` as a linear layer into as many outputs as there are unique target chars
@@ -369,12 +395,11 @@ class Model(TrainableModule):
             encode = self.encoder(images, il)
         else:
             encode = self.encoder(images, input_lengths)
+        
         if mark_lengths is not None:
-            #return self.decoder_training(images, marks, input_lengths, mark_lengths)
             return self.decoder_training(encode, marks)
         else:
             return self.decoder_prediction(encode, max_length=encode.shape[1] + 10)
-
 
     def encoder(self, images: torch.Tensor, input_lengths) -> torch.Tensor:
 
@@ -383,21 +408,35 @@ class Model(TrainableModule):
         x = self.conv(images)
 
         batch_size, channels, height, width = x.size()
-        x = x.permute(0,3,1,2).reshape(batch_size, width, height * channels)
-
-        x = self.dense(x)
-        new_input_lengths = (input_lengths // 4).cpu()
+        #x = x.permute(0,3,1,2).reshape(batch_size, width, height * channels)
+        x = x.permute(0,3,1,2).reshape(batch_size, width *  height, channels)
         
+        #x = self.dense(x)
+        new_input_lengths = (input_lengths // 16).cpu()
+
         x = torch.nn.utils.rnn.pack_padded_sequence(x, new_input_lengths, batch_first=True, enforce_sorted=False)
         x, _ = self.rnn(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
 
         forward, backward = torch.chunk(x, 2, dim=-1)
+        x = forward + backward
+       
+        #return x
+
+        x_pack = torch.nn.utils.rnn.pack_padded_sequence(x, new_input_lengths, batch_first=True, enforce_sorted=False)
+        residual, _ = self.secrnn(x_pack)
+        residual, _ = torch.nn.utils.rnn.pad_packed_sequence(residual, batch_first=True)
+
+        #x = x + residual
+        forward, backward = torch.chunk(residual, 2, dim=-1)
         hidden = forward + backward
 
-        #print("finished encoder forward {hidden.shape}")
+        x = x + hidden
+        
+        #print(f"x shape {x.shape}")
 
-        return hidden
+        return x
+        
 
     def decoder_training(self,  encoded: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         targets_list = targets[:, :-1].tolist()
@@ -417,6 +456,7 @@ class Model(TrainableModule):
         outputs = []
         for i in range(inputs.size(1)):
             x_t = x[:, i, :]
+            #print(f"x_t shape {x_t.shape}")
             state = self._target_rnn_cell(x_t, state)
             outputs.append(state)
         
@@ -506,12 +546,12 @@ class Model(TrainableModule):
                 "".join(predicted_words)))
 
         return result
-
+    
     def test_step(self, xs, y):
         with torch.no_grad():
             y_pred = self.forward(*xs)
             return self.compute_metrics(y_pred, y, *xs, training=False)
-
+    
     def predict_step(self, xs, as_numpy=True):
         with torch.no_grad():
             batch = self.forward(*xs)
@@ -559,7 +599,7 @@ def main(args: argparse.Namespace) -> None:
         padding = (0, 0, 0, pad_w, 0, pad_h)
 
         # Apply padding
-        padded_image = F.pad(image, padding, mode='constant', value=-1)  # assuming white padding
+        padded_image = F.pad(image, padding, mode='constant', value=1)  # assuming white padding
 
         #return torch.tensor(padded_image)
         return padded_image
@@ -619,7 +659,7 @@ def main(args: argparse.Namespace) -> None:
 
     model.configure(
         optimizer=torch.optim.Adam(model.parameters()),
-        loss=torch.nn.CrossEntropyLoss(ignore_index=0),
+        loss=torch.nn.CrossEntropyLoss(),
         #loss=torch.nn.CTCLoss(zero_infinity=True),
         #metrics={"edit_distance": torchmetrics.functional.edit_distance},
         #metrics={"edit_distance": CommonVoiceCs.EditDistanceMetric(0)},
