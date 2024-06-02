@@ -340,9 +340,9 @@ class Model(TrainableModule):
         )
         """
         self.rnn = torch.nn.LSTM(
-                        input_size=256,
+                        input_size=256 * 12,
                         hidden_size=args.rnn_dim,
-                        num_layers=1,
+                        num_layers=2,
                         bidirectional=True,
                         batch_first=True,
                         dropout=0.2
@@ -351,7 +351,7 @@ class Model(TrainableModule):
         self.secrnn = torch.nn.LSTM(
                         input_size=args.rnn_dim,
                         hidden_size=args.rnn_dim,
-                        num_layers=1,
+                        num_layers=2,
                         bidirectional=True,
                         batch_first=True,
                         dropout=0.2
@@ -408,9 +408,11 @@ class Model(TrainableModule):
         x = self.conv(images)
 
         batch_size, channels, height, width = x.size()
-        #x = x.permute(0,3,1,2).reshape(batch_size, width, height * channels)
-        x = x.permute(0,3,1,2).reshape(batch_size, width *  height, channels)
+        x = x.permute(0,3,1,2).reshape(batch_size, width, height * channels)
+        #x = x.permute(0,3,1,2).reshape(batch_size, width *  height, channels)
         
+        #x = x.reshape(batch_size, -1, channels * height)
+
         #x = self.dense(x)
         new_input_lengths = (input_lengths // 16).cpu()
 
@@ -444,7 +446,7 @@ class Model(TrainableModule):
 
         inputs = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(inp, dtype=torch.long) for inp in inputs],
-            batch_first=True, padding_value=0#HOMRDataset.MARKS[0]
+            batch_first=True, padding_value=1#HOMRDataset.MARKS[0]
         ).to(encoded.device)
 
         self._target_rnn_cell.setup_memory(encoded)
@@ -678,11 +680,16 @@ def main(args: argparse.Namespace) -> None:
 
         for sequence in predictions:
             print(sequence)
-            #best_hypothesis = sequence[0]
             print(" ".join(homr.MARKS[mark] for mark in sequence), file=predictions_file)
-            #sentence = "".join(homr.MARKS[char] for char in best_hypothesis.tokens.tolist())
-            #print(sentence, file=predictions_file)
 
+    dev = torch.utils.data.DataLoader(dev, args.batch_size, shuffle=False, collate_fn=lambda x: prepare_batch(x, is_test=True))
+    with open(os.path.join(args.logdir, "homr_competition_dev.txt"), "w", encoding="utf-8") as predictions_file:
+        # TODO: Predict the sequences of recognized marks.
+        predictions = model.predict(dev)
+
+        for sequence in predictions:
+            #print(sequence)
+            print(" ".join(homr.MARKS[mark] for mark in sequence), file=predictions_file)
 
 if __name__ == "__main__":
     main(parser.parse_args([] if "__file__" not in globals() else None))
