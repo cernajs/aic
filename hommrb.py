@@ -15,6 +15,7 @@ from torch.nn.modules.loss import CrossEntropyLoss
 from torch.optim import Adam
 import torchmetrics
 import torch.nn.functional as F
+import torchvision.transforms as transforms
 
 from homr_dataset import HOMRDataset
 
@@ -391,9 +392,12 @@ class Model(TrainableModule):
 
     def forward(self, images, input_lengths = None, marks = None, mark_lengths = None):
         if input_lengths is None:
-            il = torch.tensor([200, 200])
+            #il = torch.tensor([200, 200])
+            il = torch.tensor([160, 160])
+            #print("no input_lengths")
             encode = self.encoder(images, il)
         else:
+            #print("input_lengths")
             encode = self.encoder(images, input_lengths)
         
         if mark_lengths is not None:
@@ -409,16 +413,18 @@ class Model(TrainableModule):
 
         batch_size, channels, height, width = x.size()
         x = x.permute(0,3,1,2).reshape(batch_size, width, height * channels)
-        #x = x.permute(0,3,1,2).reshape(batch_size, width *  height, channels)
-        
-        #x = x.reshape(batch_size, -1, channels * height)
+       
+        print("after conv")
 
         #x = self.dense(x)
         new_input_lengths = (input_lengths // 16).cpu()
+        print(f"new_input_lengths {new_input_lengths}")
 
         x = torch.nn.utils.rnn.pack_padded_sequence(x, new_input_lengths, batch_first=True, enforce_sorted=False)
         x, _ = self.rnn(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+
+        print("after rnn")
 
         forward, backward = torch.chunk(x, 2, dim=-1)
         x = forward + backward
@@ -446,7 +452,7 @@ class Model(TrainableModule):
 
         inputs = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(inp, dtype=torch.long) for inp in inputs],
-            batch_first=True, padding_value=1#HOMRDataset.MARKS[0]
+            batch_first=True, padding_value=0
         ).to(encoded.device)
 
         self._target_rnn_cell.setup_memory(encoded)
@@ -585,10 +591,15 @@ def main(args: argparse.Namespace) -> None:
     # - "marks", a `[num_marks]` tensor with indices of marks on the image.
     homr = HOMRDataset(decode_on_demand=True)
 
+    """
     def pad_image(image, target_size=(200, 1720)):
         # Extract current image dimensions
         current_size = image.shape[:2]
 
+        target_height = 160
+        resize_transform = transforms.Resize((target_height, int(image.shape[1] * (target_height / image.shape[0]))))
+        image = resize_transform(image)
+        
         #print(f"image shape in pad {image.shape}")
 
         # Calculate padding for each dimension
@@ -598,31 +609,53 @@ def main(args: argparse.Namespace) -> None:
         # Padding for height and width
         #padding = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
 
-        padding = (0, 0, 0, pad_w, 0, pad_h)
+        #padding = (0, 0, 0, pad_w, 0, pad_h)
+        padding = (0, 0, 0, pad_w, 0, 0)
 
         # Apply padding
-        padded_image = F.pad(image, padding, mode='constant', value=1)  # assuming white padding
+        padded_image = F.pad(image, padding, mode='constant', value=-1)  # assuming white padding
 
         #return torch.tensor(padded_image)
+        return padded_image
+    """
+
+    def pad_image(image, target_height=200, target_width=1720, padding_value=-1):
+        # Resize the height to target_height while maintaining the aspect ratio
+        #resize_transform = transforms.Resize((target_height, int(image.shape[1] * (target_height / image.shape[0]))))
+        resize_transform = transforms.Resize((target_height, image.shape[1]))
+        resized_image = resize_transform(image.permute(2, 0, 1))
+        resized_image = resized_image.permute(1, 2, 0)
+
+        #print(f"image {image.shape}")
+        #print(f"resized_image {resized_image.shape}")
+
+        current_height, current_width = resized_image.shape[:2]
+        pad_w = target_width - current_width
+        
+
+        # Apply padding to width
+        padding = (0, 0, 0, pad_w)  # (left, right, top, bottom)
+
+        # Apply padding
+        padded_image = F.pad(resized_image, padding, mode='constant', value=padding_value)
+
         return padded_image
 
     def prepare_data(example, is_test=False):
         #IMAGE [HEIGHT, WIDTH, 1]
         images = example["image"] / 255.0
 
-        #images = [pad_image(img) for img in images]
+        images_lengths = torch.tensor([len(image) for image in images])
+        height, width, channels = images.shape 
         images = pad_image(images)
-        #print(f"images len {len(images)}")
+
         if is_test:
-            return images
+            return images, torch.tensor([height, width])
         
-        #print(example["marks"])
-        #print(torch.cat((example["marks"], torch.tensor([homr_eow]))))
-        #exit()
         
         marks = torch.cat((example["marks"], torch.tensor([homr_eow])))
 
-        return images, marks
+        return images, marks, torch.tensor([height, width])
 
 
 
@@ -634,19 +667,25 @@ def main(args: argparse.Namespace) -> None:
     def prepare_batch(data, is_test=False):
 
         if is_test:
-            images = torch.stack([torch.tensor(img) for img in data])
-            images_lengths = torch.tensor([len(image) for image in images])
-            images = torch.nn.utils.rnn.pad_sequence(images, batch_first=True)
-            #return (images, images_lengths, torch.tensor(0), torch.tensor(0)), torch.tensor(0)
+            image, lengths = zip(*data)
+            #print(lengths)
+            images = torch.stack([torch.tensor(img) for img in image])
+            #images_lengths = torch.tensor([len(image) for image in images])
+            images_lengths = torch.tensor([length[1] for length in lengths])
+            images = torch.nn.utils.rnn.pad_sequence(images, batch_first=True, padding_value=-1)
+            
+            #print(images_lengths)
+
             return (images, images_lengths), torch.tensor(0)
 
-        images, marks = zip(*data)
+        images, marks, lengths = zip(*data)
 
-        images_lengths = torch.tensor([len(image) for image in images])
+        #images_lengths = torch.tensor([len(image) for image in images])
+        images_lengths = torch.tensor([length[1] for length in lengths])
         images = torch.stack([torch.tensor(img) for img in images])
 
         marks_lengths = torch.tensor([len(mark) for mark in marks])
-        marks = torch.nn.utils.rnn.pad_sequence(marks, batch_first=True)
+        marks = torch.nn.utils.rnn.pad_sequence(marks, batch_first=True, padding_value=0)
         marks = torch.stack([x for x in marks])
 
 
@@ -680,15 +719,6 @@ def main(args: argparse.Namespace) -> None:
 
         for sequence in predictions:
             print(sequence)
-            print(" ".join(homr.MARKS[mark] for mark in sequence), file=predictions_file)
-
-    dev = torch.utils.data.DataLoader(dev, args.batch_size, shuffle=False, collate_fn=lambda x: prepare_batch(x, is_test=True))
-    with open(os.path.join(args.logdir, "homr_competition_dev.txt"), "w", encoding="utf-8") as predictions_file:
-        # TODO: Predict the sequences of recognized marks.
-        predictions = model.predict(dev)
-
-        for sequence in predictions:
-            #print(sequence)
             print(" ".join(homr.MARKS[mark] for mark in sequence), file=predictions_file)
 
 if __name__ == "__main__":
