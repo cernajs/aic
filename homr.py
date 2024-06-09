@@ -1,30 +1,45 @@
 #!/usr/bin/env python3
+
+# 21e65bb3-23db-11ec-986f-f39926f24a9c
+# e4553c7b-e907-46c6-98e5-f08d1ce8f040
+
 import argparse
 import datetime
 import os
 import re
 
 import numpy as np
+from numpy.core.fromnumeric import squeeze
 import torch
-from torchvision import transforms as v2
+from torch.nn.modules.loss import CrossEntropyLoss
+from torch.optim import Adam
 import torchmetrics
-import torchaudio
-import torchaudio.models.decoder
-
 import torch.nn.functional as F
+import torchvision.transforms as transforms
 
 from homr_dataset import HOMRDataset
 
-# TODO: Define reasonable defaults and optionally more parameters.
-# Also, you can set the number of threads to 0 to use all your CPU cores.
 parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", default=8, type=int, help="Batch size.")
-parser.add_argument("--epochs", default=2, type=int, help="Number of epochs.")
+# These arguments will be set appropriately by ReCodEx, even if you change them.
+parser.add_argument("--batch_size", default=32, type=int, help="Batch size.")
+parser.add_argument("--cle_dim", default=64, type=int, help="CLE embedding dimension.")
+parser.add_argument("--epochs", default=30, type=int, help="Number of epochs.")
+parser.add_argument("--max_sentences", default=None, type=int, help="Maximum number of sentences to load.")
+parser.add_argument("--recodex", default=False, action="store_true", help="Evaluation in ReCodEx.")
+parser.add_argument("--rnn_dim", default=512, type=int, help="RNN layer dimension.")
 parser.add_argument("--seed", default=42, type=int, help="Random seed.")
+parser.add_argument("--show_results_every_batch", default=10, type=int, help="Show results every given batch.")
+parser.add_argument("--tie_embeddings", default=False, action="store_true", help="Tie target embeddings.")
 parser.add_argument("--threads", default=1, type=int, help="Maximum number of threads to use.")
-parser.add_argument("--visualize", default=False, type=str, help="Visualize the data.")
+
+parser.add_argument("--learning_rate", default=1e-3, type=float, help="Learning rate")
+parser.add_argument("--dropout", default=0.5, type=float, help="Dropout.")
+parser.add_argument("--rnn_layers", default=3, type=int, help="RNN dimension.")
+# If you add more arguments, ReCodEx will keep them with your default values.
 
 
+homr_bow = HOMRDataset.MARKS.index("bow")
+homr_eow = HOMRDataset.MARKS.index("eow")
 
 class TrainableModule(torch.nn.Module):
     """A simple Keras-like module for training with raw PyTorch.
@@ -91,8 +106,6 @@ class TrainableModule(torch.nn.Module):
             data_and_progress = self._tqdm(
                 dataloader, epoch_message, unit="batch", leave=False, disable=None if verbose == 2 else not verbose)
             for xs, y in data_and_progress:
-                #print(f"xs {xs}")
-                #print(f"y {y}")
                 xs, y = tuple(x.to(self.device) for x in (xs if isinstance(xs, tuple) else (xs,))), y.to(self.device)
                 logs = self.train_step(xs, y)
                 message = [epoch_message] + [f"{k}={v:.{0<abs(v)<2e-4 and '3g' or '4f'}}" for k, v in logs.items()]
@@ -112,9 +125,6 @@ class TrainableModule(torch.nn.Module):
 
         A dictionary with the loss and metrics should be returned."""
         self.zero_grad()
-
-        #print(f"Batch size: {xs[0].size(0)}, Input lengths: {xs[1].size(0)}, Target lengths: {y[1].size(0)}")
-
         y_pred = self.forward(*xs)
         loss = self.compute_loss(y_pred, y, *xs)
         loss.backward()
@@ -124,10 +134,12 @@ class TrainableModule(torch.nn.Module):
             self.loss_metric.update(loss)
             return {"loss": self.loss_metric.compute()} \
                 | ({"lr": self.schedule.get_last_lr()[0]} if self.schedule else {}) \
-                #| self.compute_metrics(y_pred, y, *xs, training=True)
+                | self.compute_metrics(y_pred, y, *xs, training=True)
 
     def compute_loss(self, y_pred, y, *xs):
         """Compute the loss of the model given the inputs, predictions, and target outputs."""
+        #print(f"y_pred {y_pred.shape}")
+        #print(f"y {y.shape}")
         return self.loss(y_pred, y)
 
     def compute_metrics(self, y_pred, y, *xs, training):
@@ -157,7 +169,7 @@ class TrainableModule(torch.nn.Module):
         with torch.no_grad():
             y_pred = self.forward(*xs)
             self.loss_metric.update(self.compute_loss(y_pred, y, *xs))
-            return {"loss": self.loss_metric.compute()}# | self.compute_metrics(y_pred, y, *xs, training=False)
+            return {"loss": self.loss_metric.compute()} | self.compute_metrics(y_pred, y, *xs, training=False)
 
     def predict(self, dataloader, as_numpy=True):
         """Compute predictions for the given dataset.
@@ -183,9 +195,6 @@ class TrainableModule(torch.nn.Module):
         """An overridable method performing a single prediction step."""
         with torch.no_grad():
             batch = self.forward(*xs)
-
-            batch = batch.contiguous()
-
             return batch.numpy(force=True) if as_numpy else batch
 
     def writer(self, writer):
@@ -220,103 +229,357 @@ class TrainableModule(torch.nn.Module):
                     parameter.data[module.hidden_size:module.hidden_size * 2] = 1
 
 
-
-class HomrModel(TrainableModule):
-    def __init__(self, homr: HOMRDataset, args: argparse.Namespace):
+class WithAttention(torch.nn.Module):
+    """A class adding Bahdanau attention vo the given RNN cell."""
+    def __init__(self, cell, attention_dim):
         super().__init__()
+        self._cell = cell
+
+        # TODO: Define
+        # - `self._project_encoder_layer` as a linear layer with `cell.hidden_size` inputs
+        #   and `attention_dim` outputs.
+        # - `self._project_decoder_layer` as a linear layer with `cell.hidden_size` inputs
+        #   and `attention_dim` outputs
+        # - `self._output_layer` as a linear layer with `attention_dim` inputs and 1 output
+
+        self._project_encoder_layer = torch.nn.Linear(cell.hidden_size, attention_dim)
+
+        self._project_decoder_layer = torch.nn.Linear(cell.hidden_size, attention_dim)
+
+        self._output_layer = torch.nn.Linear(attention_dim, 1)
+
+    def setup_memory(self, encoded):
+        self._encoded = encoded
+        # TODO: Pass the `encoded` through the `self._project_encoder_layer` and store
+        # the result as `self._encoded_projected`.
+        self._encoded_projected = self._project_encoder_layer(encoded)
+
+    def forward(self, inputs, states):
+        # TODO: Compute the attention.
+        # - According to the definition, we need to project the encoder states, but we have
+        #   already done that in `setup_memory`, so we just take `self._encoded_projected`.
+        # - Compute projected decoder state by passing the given state through the `self._project_decoder_layer`.
+        # - Sum the two projections. However, the first has shape `[batch_size, input_sequence_len, attention_dim]`
+        #   and the second just `[batch_size, attention_dim]`, so the second needs to be expanded so that
+        #   the sum of the projections broadcasts correctly.
+        # - Pass the sum through the `torch.tanh` and then through the `self._output_layer`.
+        # - Then, run softmax on a suitable axis, generating `weights`.
+        # - Multiply the original (non-projected) encoder states `self._encoded` with `weights` and sum
+        #   the result in the axis corresponding to characters, generating `attention`. Therefore,
+        #   `attention` is a fixed-size representation for every batch element, independently on
+        #   how many characters the corresponding input form had.
+        # - Finally, concatenate `inputs` and `attention` (in this order), and call the `self._cell`
+        #   on this concatenated input and the `states`, returning the result.
+
+        projection = self._encoded_projected
+
+        projected_decoder = self._project_decoder_layer(states)
+
+        sum = projection + projected_decoder.unsqueeze(1)
+
+        output = self._output_layer(torch.tanh(sum))
+
+        probs = torch.nn.functional.softmax(output, dim=1)
+
+        attention = torch.sum(self._encoded * probs, dim=1)
+
+        #print(f"attention {attention.shape}")
+        #print(f"inputs {inputs.shape}")
+
+        stacked = torch.cat([inputs, attention], dim=1)
+
+        #print(f"stacked {stacked.shape}")
+
+        ret = self._cell(stacked, states)
+        #print(f"return shape of attention {ret.shape}")
+        return ret
+
+
+class Model(TrainableModule):
+    def __init__(self, homr: HOMRDataset, args: argparse.Namespace) -> None:
+        super().__init__()
+        self._target_vocab = homr.MARKS
+        self.args = args
+
+        # TODO(lemmatizer_noattn): Define
+        # - `self._source_embedding` as an embedding layer of source characters into `args.cle_dim` dimensions
+        # - `self._source_rnn` as a bidirectional GRU with `args.rnn_dim` units processing embedded source chars
+
+        #self._source_rnn = torch.nn.GRU(args.cle_dim, args.rnn_dim, bidirectional=True, batch_first=True)
+
+        # TODO: Define
+        # - `self._target_rnn_cell` as a `WithAttention` with `attention_dim=args.rnn_dim`, employing as the
+        #   underlying cell the `torch.nn.GRUCell` with `args.rnn_dim`. The cell will process concatenated
+        #   target character embeddings and the result of the attention mechanism.
+        # self._target_rnn_cell = WithAttention(torch.nn.GRUCell(args.rnn_dim + 64, args.rnn_dim), args.rnn_dim)
+
+        self._target_rnn_cell = WithAttention(torch.nn.GRUCell(args.rnn_dim + args.cle_dim, args.rnn_dim), args.rnn_dim)
 
         self.conv = torch.nn.Sequential(
             torch.nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(32),
             torch.nn.ReLU(),
             torch.nn.MaxPool2d(2),
+            
             torch.nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(64),
+            torch.nn.ReLU(),
+            torch.nn.MaxPool2d(2),
+
+            torch.nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(128),
+            torch.nn.ReLU(),
+            torch.nn.MaxPool2d(2),
+
+            torch.nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            torch.nn.BatchNorm2d(256),
             torch.nn.ReLU(),
             torch.nn.MaxPool2d(2),
         )
-
-        image_height = 135
+        
+        """
+        image_height = 200
+        image_width = 1720
         self.dense = torch.nn.Sequential(
-            torch.nn.Linear((image_height // 4) * 64, 64),
+            #torch.nn.Linear((image_width // 16) * (image_height // 16) * 256, 512),
+            torch.nn.Linear(256,512),
             torch.nn.ReLU(),
             torch.nn.Dropout(0.2)
         )
-
-        self.tokens = homr.MARKS
-
-        self.rnn = torch.nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True)
-        self.output = torch.nn.Linear(128, len(self.tokens) + 1)
-
-        self.decoder = torchaudio.models.decoder.ctc_decoder(
-            lexicon=None,
-            tokens=self.tokens,
-            beam_size=3,
-            sil_token=" "
-        )
-
-    def forward(self, images, input_lengths, mark_lengths):
-        images = images.permute(0, 3, 1, 2)
-        #print(images.shape)
-        x = self.conv(images)
-        #print(f"after conv {x.shape}")
         
+        self.rnn = torch.nn.LSTM(
+                        input_size=256 * 12,
+                        hidden_size=args.rnn_dim,
+                        num_layers=2,
+                        bidirectional=True,
+                        batch_first=True,
+                        dropout=0.2
+                    )
+        
+        self.secrnn = torch.nn.LSTM(
+                        input_size=args.rnn_dim,
+                        hidden_size=args.rnn_dim,
+                        num_layers=2,
+                        bidirectional=True,
+                        batch_first=True,
+                        dropout=0.2
+                    )
+        """
+
+        self._dropout_layer = torch.nn.Dropout(args.dropout)
+
+        self._rnn = torch.nn.ModuleList([torch.nn.LSTM(256 * 12, args.rnn_dim, batch_first=True, bidirectional=True)])
+        self._rnn.extend([torch.nn.LSTM(args.rnn_dim, args.rnn_dim, batch_first=True, bidirectional=True) for _ in range(args.rnn_layers - 1)])
+
+        # TODO(lemmatizer_noattn): Then define
+        # - `self._target_output_layer` as a linear layer into as many outputs as there are unique target chars
+        self._target_output_layer = torch.nn.Linear(args.rnn_dim, len(self._target_vocab))
+
+        if not args.tie_embeddings:
+            # TODO(lemmatizer_noattn): Define the `self._target_embedding` as an embedding layer of the target
+            # characters into `args.cle_dim` dimensions.
+            
+            #self._target_embedding = torch.nn.Embedding(len(self._target_vocab), 32)
+            self._target_embedding = torch.nn.Embedding(len(self._target_vocab), args.cle_dim)
+        else:
+            # TODO(lemmatizer_noattn): Create a function `self._target_embedding` computing the embedding of given
+            # target characters. When called, use `torch.nn.functional.embedding` to suitably
+            # index the shared embedding matrix `self._target_output_layer.weight`
+            # multiplied by the square root of `args.rnn_dim`.
+            def embedding_function(chars):
+                return torch.nn.functional.embedding(
+                    chars, self._target_output_layer.weight * (args.rnn_dim ** 0.5)
+                )
+
+            self._target_embedding = embedding_function
+        
+        #print(f"len(self._target_vocab) {len(self._target_vocab)}")
+        # Initialize the layers using the Keras-inspired initialization. You can try
+        # removing this line to see how much worse the default PyTorch initialization is.
+        self.apply(self.keras_init)
+
+        self._show_results_every_batch = args.show_results_every_batch
+        self._batches = 0
+
+
+    def forward(self, images, input_lengths = None, marks = None, mark_lengths = None):
+        if input_lengths is None:     
+            #only for prints while training
+            il = torch.tensor([160, 160])
+            encode = self.encoder(images, il)
+        
+        else:
+            encode = self.encoder(images, input_lengths)
+        
+        if mark_lengths is not None:
+            return self.decoder_training(encode, marks)
+        else:
+            return self.decoder_prediction(encode, max_length=encode.shape[1] + 10)
+
+    def encoder(self, images: torch.Tensor, input_lengths) -> torch.Tensor:
+
+        images = images.permute(0, 3, 1, 2)
+
+        x = self.conv(images)
+
         batch_size, channels, height, width = x.size()
         x = x.permute(0,3,1,2).reshape(batch_size, width, height * channels)
+       
+        new_input_lengths = (input_lengths // 16).cpu()
+        hidden = torch.nn.utils.rnn.pack_padded_sequence(x, new_input_lengths, batch_first=True, enforce_sorted=False)
+       
+        for i, rnn in enumerate(self._rnn):
+            residual = hidden
+            hidden, _ = rnn(hidden)
+            forward, backward = torch.chunk(hidden.data, 2, dim=-1)
+            hidden = self._dropout_layer(forward + backward)
+            if i:
+                hidden += residual.data
+            hidden = torch.nn.utils.rnn.PackedSequence(hidden, *residual[1:])
 
+        hidden, _ = torch.nn.utils.rnn.pad_packed_sequence(hidden, batch_first=True)
 
-        x = self.dense(x)
-        new_input_lengths = (input_lengths // 4).cpu()
+        return hidden
 
-        x = torch.nn.utils.rnn.pack_padded_sequence(x, new_input_lengths, batch_first=True, enforce_sorted=False)
-
-        #x = torch.nn.utils.rnn.pack_padded_sequence(x, input_lengths, batch_first=True, enforce_sorted=False)
+        """
         x, _ = self.rnn(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
 
-        x = self.output(x)
+
+        forward, backward = torch.chunk(x, 2, dim=-1)
+        x = forward + backward
+       
+
+        x_pack = torch.nn.utils.rnn.pack_padded_sequence(x, new_input_lengths, batch_first=True, enforce_sorted=False)
+        residual, _ = self.secrnn(x_pack)
+        residual, _ = torch.nn.utils.rnn.pad_packed_sequence(residual, batch_first=True)
+
+        forward, backward = torch.chunk(residual, 2, dim=-1)
+        hidden = forward + backward
+
+        x = x + hidden
 
         return x
+        """        
 
-    def compute_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor, images, input_lengths, target_lengths) -> torch.Tensor:
-        # TODO: Compute the loss, most likely using the `torch.nn.CTCLoss` class.
-        #print(f"y_pred {y_pred.shape}")
-        #print(f"y_true {y_true.shape}")
-        #print(f"input_lengths {input_lengths.shape}")
-        #print(f"target_lengths {target_lengths}")
+    def decoder_training(self,  encoded: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets_list = targets[:, :-1].tolist()
+        inputs = [[homr_bow] + target for target in targets_list]
 
-        y_pred = y_pred.permute(1,0,2)
-        y_true = y_true.view(-1)
+        inputs = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(inp, dtype=torch.long) for inp in inputs],
+            batch_first=True, padding_value=0
+        ).to(encoded.device)
+
+        self._target_rnn_cell.setup_memory(encoded)
+
+        x = self._target_embedding(inputs)
         
-        y_true_flat = y_true[y_true != 0]
-        true_input_lengths = input_lengths // 4
+        state = encoded[:,0,:]
+        
+        outputs = []
+        for i in range(inputs.size(1)):
+            x_t = x[:, i, :]
+            state = self._target_rnn_cell(x_t, state)
+            outputs.append(state)
+        
+        outputs = torch.stack(outputs, dim=1)
+        
+        ret = self._target_output_layer(outputs).permute(0, 2, 1)
+        return ret
 
-        return self.loss(y_pred, y_true_flat, true_input_lengths, target_lengths)
+    def decoder_prediction(self, encoded: torch.Tensor, max_length: int) -> torch.Tensor:
+        batch_size = encoded.shape[0]
 
-    def ctc_decoding(self, y_pred: torch.Tensor, y_true: torch.Tensor, images, input_lengths) -> list[torch.Tensor]:
-        # TODO: Compute predictions, either using manual CTC decoding, or you
-        # can use:
-        # - `torchaudio.models.decoder.ctc_decoder`, which is CPU-based decoding with
-        #   rich functionality;
-        # - `torchaudio.models.decoder.cuda_ctc_decoder`, which is faster GPU-based
-        #   decoder with limited functionality.
+        # TODO(decoder_training): Pre-compute the projected encoder states in the attention by calling
+        # the `setup_memory` of the `self._target_rnn_cell` on the `encoded` input.
+        self._target_rnn_cell.setup_memory(encoded)
 
-        probabilities = torch.nn.functional.softmax(y_pred, dim=2)
+        # TODO: Define the following variables, that we will use in the cycle:
+        # - `index`: the time index, initialized to 0;
+        # - `inputs`: a tensor of shape `[batch_size]` containing the `MorphoDataset.BOW` symbols,
+        # - `states`: initial RNN state from the encoder, i.e., `encoded[:, 0]`.
+        # - `results`: an empty list, where generated outputs will be stored;
+        # - `result_lengths`: a tensor of shape `[batch_size]` filled with `max_length`,
+        index = 0
+        inputs = torch.full((batch_size,), homr_bow, dtype=torch.long, device=encoded.device)
+        states = encoded[:, 0]
+        results = []
+        result_lengths = torch.full((batch_size,), max_length, dtype=torch.long, device=encoded.device)
 
-        probabilities = probabilities.permute(1, 0, 2).contiguous().cpu()
+        while index < max_length and torch.any(result_lengths == max_length):
+            # TODO(lemmatizer_noattn):
+            # - First embed the `inputs` using the `self._target_embedding` layer.
+            # - Then call `self._target_rnn_cell` using two arguments, the embedded `inputs`
+            #   and the current `states`. The call returns a single tensor, which you should
+            #   store as both a new `hidden` and a new `states`.
+            # - Pass the outputs through the `self._target_output_layer`.
+            # - Generate the most probable prediction for every batch example.
+            embeding = self._target_embedding(inputs)
 
-        decoded = self.decoder(probabilities)
+            hidden = self._target_rnn_cell(embeding, states)
+            states = hidden
 
-        return decoded
+            rnn_output = self._target_output_layer(hidden)
 
+            predictions = rnn_output.argmax(dim=-1)
+
+            # Store the predictions in the `results` and update the `result_lengths`
+            # by setting it to current `index` if an EOW was generated for the first time.
+            results.append(predictions)
+            result_lengths[(predictions == homr_eow) & (result_lengths > index)] = index + 1
+
+            # TODO(lemmatizer_noattn): Finally,
+            # - set `inputs` to the `predictions`,
+            # - increment the `index` by one.
+            inputs = predictions
+            index += 1
+
+        results = torch.stack(results, dim=1)
+        return results
+
+    def compute_metrics(self, y_pred, y, *xs, training):
+        if training:
+            y_pred = y_pred.argmax(dim=-2)
+        y_pred = y_pred[:, :y.shape[-1]]
+        y_pred = torch.nn.functional.pad(y_pred, (0, y.shape[-1] - y_pred.shape[-1]), value=0)
+        #self.metrics["accuracy"](torch.all((y_pred == y) | (y == 0), dim=-1))
+        return self.metrics.compute()
+
+    def train_step(self, xs, y):
+        result = super().train_step(xs, y)
+        
+        self._batches += 1
+       
+        if self._batches % self._show_results_every_batch == 0 and False:
+            
+            predicted_indices = self.predict_step((xs[0][:self.args.batch_size],))[0]
+            predicted_indices = predicted_indices.tolist()
+            predicted_words = [self._target_vocab[idx] for idx in predicted_indices]
+
+            self._tqdm.write("{}: {} -> {}".format(
+                self._batches,
+                "idk",#"".join(self._source_vocab.strings(np.trim_zeros(xs[0][0].numpy(force=True)))),
+                #"".join(self._target_vocab[self.predict_step((xs[0][:2],))[0]])))
+                "".join(predicted_words)))
+
+        return result
+    
+    def test_step(self, xs, y):
+        with torch.no_grad():
+            y_pred = self.forward(*xs)
+            return self.compute_metrics(y_pred, y, *xs, training=False)
+    
     def predict_step(self, xs, as_numpy=True):
         with torch.no_grad():
-            # Perform constrained decoding.
-            batch = self.ctc_decoding(self.forward(*xs), *xs)
-            #batch = [torch.tensor(x) for x in batch]
-            
+            batch = self.forward(*xs)
+            #batch = self.decoder_prediction(*xs)
+            # If `as_numpy==True`, trim t.shhe predictions at the first EOW.
             if as_numpy:
-                batch = [example.numpy(force=True) if isinstance(example, torch.Tensor) else example for example in batch]
-                #batch = [example.numpy(force=True) for example in batch]
+                batch = [example[np.cumsum(example == homr_eow) == 0] for example in batch.numpy(force=True)]
             return batch
+
+
 
 def main(args: argparse.Namespace) -> None:
     # Set the random seed and the number of threads.
@@ -338,38 +601,71 @@ def main(args: argparse.Namespace) -> None:
     # - "marks", a `[num_marks]` tensor with indices of marks on the image.
     homr = HOMRDataset(decode_on_demand=True)
 
-    def pad_image(image, target_size=(135, 1400)):
+    """
+    def pad_image(image, target_size=(200, 1720)):
         # Extract current image dimensions
         current_size = image.shape[:2]
-       
+
+        target_height = 160
+        resize_transform = transforms.Resize((target_height, int(image.shape[1] * (target_height / image.shape[0]))))
+        image = resize_transform(image)
+        
         #print(f"image shape in pad {image.shape}")
 
         # Calculate padding for each dimension
         pad_h = target_size[0] - current_size[0]
         pad_w = target_size[1] - current_size[1]
-        
+
         # Padding for height and width
         #padding = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
-        
-        padding = (0, 0, 0, pad_w, 0, pad_h)
+
+        #padding = (0, 0, 0, pad_w, 0, pad_h)
+        padding = (0, 0, 0, pad_w, 0, 0)
 
         # Apply padding
         padded_image = F.pad(image, padding, mode='constant', value=-1)  # assuming white padding
-        
+
         #return torch.tensor(padded_image)
+        return padded_image
+    """
+
+    def pad_image(image, target_height=200, target_width=1720, padding_value=-1):
+        # Resize the height to target_height while maintaining the aspect ratio
+        #resize_transform = transforms.Resize((target_height, int(image.shape[1] * (target_height / image.shape[0]))))
+        resize_transform = transforms.Resize((target_height, image.shape[1]))
+        resized_image = resize_transform(image.permute(2, 0, 1))
+        resized_image = resized_image.permute(1, 2, 0)
+
+        #print(f"image {image.shape}")
+        #print(f"resized_image {resized_image.shape}")
+
+        current_height, current_width = resized_image.shape[:2]
+        pad_w = target_width - current_width
+        
+
+        # Apply padding to width
+        padding = (0, 0, 0, pad_w)  # (left, right, top, bottom)
+
+        # Apply padding
+        padded_image = F.pad(resized_image, padding, mode='constant', value=padding_value)
+
         return padded_image
 
     def prepare_data(example, is_test=False):
         #IMAGE [HEIGHT, WIDTH, 1]
         images = example["image"] / 255.0
-        
-        #images = [pad_image(img) for img in images] 
+
+        images_lengths = torch.tensor([len(image) for image in images])
+        height, width, channels = images.shape 
         images = pad_image(images)
-        #print(f"images len {len(images)}")        
+
         if is_test:
-            return images
+            return images, torch.tensor([height, width])
         
-        return images, example["marks"]
+        
+        marks = torch.cat((example["marks"], torch.tensor([homr_eow])))
+
+        return images, marks, torch.tensor([height, width])
 
 
 
@@ -379,40 +675,46 @@ def main(args: argparse.Namespace) -> None:
     test = homr.test.transform(lambda example: prepare_data(example, is_test=True))
 
     def prepare_batch(data, is_test=False):
-        
+
         if is_test:
-            images = torch.stack([torch.tensor(img) for img in data]) 
-            images_lengths = torch.tensor([len(image) for image in images])
-            images = torch.nn.utils.rnn.pad_sequence(images, batch_first=True)
-            return (images, images_lengths, torch.tensor(0)), torch.tensor(0)
+            image, lengths = zip(*data)
+            #print(lengths)
+            images = torch.stack([torch.tensor(img) for img in image])
+            #images_lengths = torch.tensor([len(image) for image in images])
+            images_lengths = torch.tensor([length[1] for length in lengths])
+            images = torch.nn.utils.rnn.pad_sequence(images, batch_first=True, padding_value=-1)
+            
+            #print(images_lengths)
 
-        images, marks = zip(*data)
-        
-        #for im in images:
-        #    print(im.shape)
+            return (images, images_lengths), torch.tensor(0)
 
-        images_lengths = torch.tensor([len(image) for image in images])
+        images, marks, lengths = zip(*data)
+
+        #images_lengths = torch.tensor([len(image) for image in images])
+        images_lengths = torch.tensor([length[1] for length in lengths])
         images = torch.stack([torch.tensor(img) for img in images])
-        
-        marks_lengths = torch.tensor([len(mark) for mark in marks])
-        marks = torch.nn.utils.rnn.pad_sequence(marks, batch_first=True)
-        marks = torch.stack([x for x in marks])
-        
 
-        return (images, images_lengths, marks_lengths), marks
+        marks_lengths = torch.tensor([len(mark) for mark in marks])
+        marks = torch.nn.utils.rnn.pad_sequence(marks, batch_first=True, padding_value=0)
+        marks = torch.stack([x for x in marks])
+
+
+        return (images, images_lengths, marks,  marks_lengths), marks
 
     train = torch.utils.data.DataLoader(train, args.batch_size, shuffle=True, collate_fn=lambda x: prepare_batch(x, is_test=False))
     dev = torch.utils.data.DataLoader(dev, args.batch_size, shuffle=False, collate_fn=lambda x: prepare_batch(x, is_test=False))
     test = torch.utils.data.DataLoader(test, args.batch_size, shuffle=False, collate_fn=lambda x: prepare_batch(x, is_test=True))
 
     # TODO: Create the model and train it
-    model = HomrModel(homr, args)
+    model = Model(homr, args)
 
+    optimizer = torch.optim.Adam(model.parameters(), args.learning_rate)
     model.configure(
-        optimizer=torch.optim.Adam(model.parameters()),
-        loss=torch.nn.CTCLoss(zero_infinity=True),
-        #metrics={"edit_distance": torchmetrics.functional.edit_distance},
-        #metrics={"edit_distance": CommonVoiceCs.EditDistanceMetric(0)},
+        optimizer=optimizer,
+        schedule=torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs * len(train)),
+        loss=torch.nn.CrossEntropyLoss(),
+        metrics={"accuracy": torchmetrics.Accuracy(
+            "multiclass", num_classes=1000, ignore_index=0)},
         logdir=args.logdir
     )
 
@@ -425,11 +727,8 @@ def main(args: argparse.Namespace) -> None:
         predictions = model.predict(test)
 
         for sequence in predictions:
-            best_hypothesis = sequence[0]
-            #print(" ".join(homr.MARKS[mark] for mark in sequence), file=predictions_file)
-            sentence = "".join(homr.MARKS[char] for char in best_hypothesis.tokens.tolist())
-            print(sentence, file=predictions_file)
-
+            print(sequence)
+            print(" ".join(homr.MARKS[mark] for mark in sequence), file=predictions_file)
 
 if __name__ == "__main__":
     main(parser.parse_args([] if "__file__" not in globals() else None))
